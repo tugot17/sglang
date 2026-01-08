@@ -21,7 +21,7 @@ env:
   SCCACHE_GHA_ENABLED: "true"
 
 jobs:
-  maturin-build-test:
+  build-wheel:
     if: |
       github.event_name != 'pull_request' ||
       (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
@@ -67,16 +67,23 @@ jobs:
           cache-on-failure: true
           save-if: true
 
-      - name: Test maturin build
+      - name: Build python binding
         uses: PyO3/maturin-action@v1
         with:
           working-directory: bindings/python
-          args: --release --out dist --features vendored-openssl
+          args: --profile ci --out dist --features vendored-openssl
           rust-toolchain: stable
           sccache: true
 
       - name: List built wheel
         run: ls -lh bindings/python/dist/
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: smg-wheel
+          path: bindings/python/dist/*.whl
+          retention-days: 1
 
       - name: Test wheel install
         run: |
@@ -84,6 +91,33 @@ jobs:
           python -c "import sglang_router; print('Python package: OK')"
           python -c "from sglang_router.sglang_router_rs import Router; print('Rust extension: OK')"
           python -m sglang_router.launch_router --help > /dev/null && echo "Entry point: OK"
+
+  python-unit-tests:
+    needs: build-wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: sglang-repo
+
+      - name: Move sgl-model-gateway folder to root
+        run: |
+          mv sglang-repo/sgl-model-gateway/* .
+          rm -rf sglang-repo
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: smg-wheel
+          path: dist/
+
+      - name: Install wheel
+        run: pip install dist/*.whl
 
       - name: Run Python unit tests
         run: |
@@ -157,6 +191,7 @@ jobs:
 
   gateway-e2e:
     name: ${{ matrix.name }}
+    needs: build-wheel
     if: |
       github.event_name != 'pull_request' ||
       (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
@@ -209,25 +244,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install rust dependencies
-        run: |
-          bash scripts/ci/ci_install_rust.sh
-
-      - name: Configure sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
-        with:
-          version: "v0.12.0"
-          disable_annotations: true
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: sgl-model-gateway
-          shared-key: "rust-cache"
-          cache-all-crates: true
-          cache-on-failure: true
-          save-if: true
-
       - name: Install SGLang dependencies
         run: |
           sudo --preserve-env=PATH bash scripts/ci/ci_install_dependency.sh
@@ -275,15 +291,16 @@ jobs:
           sleep 2
           curl -f --max-time 1 http://localhost:8001/sse > /dev/null 2>&1 && echo "Brave MCP Server is healthy!" || echo "Brave MCP Server responded"
 
-      - name: Build python binding
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: smg-wheel
+          path: wheel/
+
+      - name: Install wheel
         run: |
-          source "$HOME/.cargo/env"
-          export RUSTC_WRAPPER=sccache
-          cd sgl-model-gateway/bindings/python
-          python3 -m pip install --upgrade pip maturin
           pip uninstall -y sglang-router || true
-          maturin build --profile ci --features vendored-openssl --out dist
-          pip install dist/*.whl
+          pip install wheel/*.whl
 
       - name: Install e2e test dependencies
         run: |
@@ -296,7 +313,6 @@ jobs:
         run: |
           bash scripts/killall_sglang.sh "nuk_gpus"
           cd sgl-model-gateway
-          source "$HOME/.cargo/env"
           ${{ matrix.env_vars }} ROUTER_LOCAL_MODEL_PATH="/home/ubuntu/models" pytest ${{ matrix.reruns }} ${{ matrix.parallel_opts }} ${{ matrix.test_dirs }} -s -vv -o log_cli=true --log-cli-level=INFO
 
       - name: Upload benchmark results
@@ -342,7 +358,7 @@ jobs:
           cache-to: type=gha,mode=max
 
   finish:
-    needs: [maturin-build-test, unit-tests, gateway-e2e, docker-build-test]
+    needs: [build-wheel, python-unit-tests, unit-tests, gateway-e2e, docker-build-test]
     runs-on: ubuntu-latest
     steps:
       - name: Finish
