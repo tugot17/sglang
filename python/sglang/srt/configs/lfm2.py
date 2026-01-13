@@ -1,171 +1,115 @@
-from typing import Optional
+# coding=utf-8
+# Copyright 2024 Liquid AI and the HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""LFM2 (Liquid Foundation Model 2) configuration"""
 
-from transformers.configuration_utils import PretrainedConfig
+from typing import List, Optional
 
-from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
+import torch
+from transformers import CONFIG_MAPPING
+from transformers import Lfm2Config as HFLfm2Config
+from transformers.utils import logging
+
+from sglang.srt.configs.mamba_utils import (
+    Mamba2CacheParams,
+    Mamba2StateDType,
+    Mamba2StateShape,
+)
+
+logger = logging.get_logger(__name__)
 
 
-class Lfm2Config(PretrainedConfig):
-    model_type: str = "lfm2"
-    hidden_size: int
-    num_hidden_layers: int
-    num_attention_heads: int
-    num_key_value_heads: int
-    max_position_embeddings: int
-    vocab_size: int
-    block_dim: int
-    block_ff_dim: int
-    block_multiple_of: int
-    block_auto_adjust_ff_dim: bool
-    block_ffn_dim_multiplier: Optional[float]
-    block_use_swiglu: bool
-    block_norm_eps: float
-    block_use_xavier_init: bool
-    block_mlp_init_scale: float
-    block_out_init_scale: float
-    conv_L_cache: int
-    conv_bias: bool
-    conv_dim: int
-    conv_dim_out: int
-    conv_use_xavier_init: bool
-    full_attn_idxs: list[int]
-    use_pos_enc: bool
-    rope_theta: float
-    rope_scaling: Optional[dict] = None
-    norm_eps: float
-    initializer_range: float
-    use_cache: bool
-    bos_token_id: int
-    eos_token_id: int
-    pad_token_id: int
+class Lfm2Config(HFLfm2Config):
+    """
+    SGLang configuration for LFM2 models.
 
-    def __init__(
-        self,
-        hidden_size: int = 1536,
-        num_hidden_layers: int = 16,
-        num_attention_heads: int = 24,
-        num_key_value_heads: int = 8,
-        num_heads: int = 24,
-        max_position_embeddings: int = 128000,
-        vocab_size: int = 65536,
-        block_dim: int = 1536,
-        block_ff_dim: int = 10240,
-        block_multiple_of: int = 256,
-        block_auto_adjust_ff_dim: bool = True,
-        block_ffn_dim_multiplier: Optional[float] = 1.0,
-        block_use_swiglu: bool = True,
-        block_norm_eps: float = 1e-05,
-        block_use_xavier_init: bool = True,
-        block_mlp_init_scale: float = 1.0,
-        block_out_init_scale: float = 1.0,
-        conv_L_cache: int = 3,
-        conv_bias: bool = False,
-        conv_dim: int = 1536,
-        conv_dim_out: int = 1536,
-        conv_use_xavier_init: bool = True,
-        full_attn_idxs: Optional[list[int]] = None,
-        layer_types: Optional[list[str]] = None,
-        use_pos_enc: bool = True,
-        rope_theta: float = 1000000.0,
-        rope_scaling: Optional[dict] = None,
-        norm_eps: float = 1e-05,
-        initializer_range: float = 0.02,
-        use_cache: bool = True,
-        bos_token_id: int = 1,
-        eos_token_id: int = 7,
-        pad_token_id: int = 0,
-        **kwargs,
-    ):
-        self.hidden_size = hidden_size
-        self.num_hidden_layers = num_hidden_layers
-        self.num_attention_heads = num_attention_heads
-        self.num_heads = num_heads
-        self.num_key_value_heads = num_key_value_heads
-        self.max_position_embeddings = max_position_embeddings
-        self.vocab_size = vocab_size
-
-        self.block_dim = block_dim
-        self.block_ff_dim = block_ff_dim
-        self.block_multiple_of = block_multiple_of
-        self.block_auto_adjust_ff_dim = block_auto_adjust_ff_dim
-        self.block_ffn_dim_multiplier = block_ffn_dim_multiplier
-        self.block_use_swiglu = block_use_swiglu
-        self.block_norm_eps = block_norm_eps
-        self.block_use_xavier_init = block_use_xavier_init
-        self.block_mlp_init_scale = block_mlp_init_scale
-        self.block_out_init_scale = block_out_init_scale
-
-        self.conv_L_cache = conv_L_cache
-        self.conv_bias = conv_bias
-        self.conv_dim = conv_dim
-        self.conv_dim_out = conv_dim_out
-        self.conv_use_xavier_init = conv_use_xavier_init
-
-        self.full_attn_idxs = full_attn_idxs
-        self._layer_types = layer_types
-        self.use_pos_enc = use_pos_enc
-        self.rope_theta = rope_theta
-        self.rope_scaling = rope_scaling
-
-        self.norm_eps = norm_eps
-        self.initializer_range = initializer_range
-        self.use_cache = use_cache
-
-        super().__init__(
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
-            pad_token_id=pad_token_id,
-            **kwargs,
-        )
+    Extends HuggingFace's Lfm2Config with hybrid model properties needed by SGLang.
+    LFM2 uses a hybrid architecture mixing full attention and ShortConv layers.
+    """
 
     @property
-    def layer_types(self) -> list[str]:
-        types = []
-        if self._layer_types is not None:
-            for item in self._layer_types:
-                if item == "full_attention":
-                    types.append("full_attention")
-                else:
-                    types.append("short_conv")
-        else:
-            for i in range(self.num_hidden_layers):
-                if self.full_attn_idxs and i in self.full_attn_idxs:
-                    types.append("full_attention")
-                else:
-                    types.append("short_conv")
-        return types
+    def full_attention_layer_ids(self) -> List[int]:
+        """Return indices of attention layers for KV cache."""
+        return [i for i, lt in enumerate(self.layer_types) if lt == "full_attention"]
 
     @property
-    def full_attention_layer_ids(self) -> list[int]:
+    def linear_layer_ids(self) -> List[int]:
+        """Return indices of conv layers for conv state cache."""
         return [
-            idx
-            for idx, layer_type in enumerate(self.layer_types)
-            if layer_type == "full_attention"
+            i for i, lt in enumerate(self.layer_types) if lt in ("conv", "short_conv")
         ]
 
     @property
-    def short_conv_layer_ids(self) -> list[int]:
-        return [
-            idx
-            for idx, layer_type in enumerate(self.layer_types)
-            if layer_type == "short_conv"
-        ]
+    def mamba_chunk_size(self) -> int:
+        """Return chunk size for Mamba2 backend. LFM2 doesn't use chunking, return 1."""
+        return 1
 
     @property
-    def mamba2_cache_params(self) -> Mamba2CacheParams:
+    def mamba2_cache_params(self) -> Optional[Mamba2CacheParams]:
+        """
+        Get cache params for HybridReqToTokenPool initialization.
+
+        LFM2 uses ShortConv layers with a small fixed-size cache (kernel_size - 1).
+        Unlike full Mamba2 models, LFM2 only uses the conv state, not SSM temporal state.
+        """
         from sglang.srt.layers.dp_attention import get_attention_tp_size
 
+        conv_layer_ids = self.linear_layer_ids
+        if not conv_layer_ids:
+            return None
+
+        hidden_size = self.hidden_size
+        # conv_L_cache in config is kernel_size (e.g., 3)
+        conv_kernel = int(self.conv_L_cache)
+        L_cache = conv_kernel - 1  # actual cache size (e.g., 2 for kernel=3)
+
+        # get_attention_tp_size() requires initialization, default to 1 if not available
+        try:
+            tp_size = get_attention_tp_size()
+        except (AssertionError, RuntimeError):
+            tp_size = 1
+
+        # For ShortConv layers, we use a simplified Mamba2StateShape
+        # LFM2 doesn't use SSM state (state_size=0), only conv state
         shape = Mamba2StateShape.create(
-            tp_world_size=get_attention_tp_size(),
-            intermediate_size=self.conv_dim,
-            n_groups=1,
-            num_heads=1,
-            head_dim=self.conv_dim,
-            state_size=0,
-            conv_kernel=self.conv_L_cache,
+            tp_world_size=tp_size,
+            intermediate_size=hidden_size,
+            n_groups=1,  # ShortConv doesn't use grouping
+            num_heads=1,  # ShortConv is not multi-head
+            head_dim=hidden_size,  # Conv operates on full hidden dim
+            state_size=0,  # No SSM temporal state for ShortConv
+            conv_kernel=conv_kernel,
+        )
+
+        # Get conv dtype from torch default (set by model runner before this is called)
+        # Fall back to bfloat16 if default is float32
+        default_dtype = torch.get_default_dtype()
+        conv_dtype = (
+            default_dtype
+            if default_dtype in (torch.float16, torch.bfloat16)
+            else torch.bfloat16
         )
 
         return Mamba2CacheParams(
             shape=shape,
-            layers=self.short_conv_layer_ids,
+            layers=conv_layer_ids,
+            dtype=Mamba2StateDType(conv=conv_dtype, temporal=torch.float32),
         )
+
+
+# Override HuggingFace's Lfm2Config with our extended version
+# Cannot use .register() because lfm2 is already registered by transformers
+# Directly modify the internal _extra_content dict instead
+CONFIG_MAPPING._extra_content["lfm2"] = Lfm2Config
+logger.info("Registered SGLang Lfm2Config to override HuggingFace's version")

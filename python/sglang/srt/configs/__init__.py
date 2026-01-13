@@ -41,9 +41,9 @@ __all__ = [
     "DotsVLMConfig",
     "DotsOCRConfig",
     "FalconH1Config",
+    "Lfm2Config",
     "NemotronHConfig",
     "NemotronH_Nano_VL_V2_Config",
     "JetNemotronConfig",
-    "Lfm2Config",
     "JetVLMConfig",
 ]
