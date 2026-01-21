@@ -69,6 +69,7 @@ from sglang.utils import is_in_ci
 logger = logging.getLogger(__name__)
 
 # Define constants
+DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
 SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
 LOAD_FORMAT_CHOICES = [
     "auto",
@@ -109,6 +110,7 @@ QUANTIZATION_CHOICES = [
     "auto-round",
     "compressed-tensors",  # for Ktransformers
     "modelslim",  # for NPU
+    "quark_int4fp8_moe",
 ]
 
 SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES = [*QUANTIZATION_CHOICES, "unquant"]
@@ -345,6 +347,9 @@ class ServerArgs:
     log_requests_level: int = 2
     log_requests_format: str = "text"
     log_requests_target: Optional[List[str]] = None
+    uvicorn_access_log_exclude_prefixes: List[str] = dataclasses.field(
+        default_factory=lambda: list(DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES)
+    )
     crash_dump_folder: Optional[str] = None
     show_time_cost: bool = False
     enable_metrics: bool = False
@@ -370,6 +375,7 @@ class ServerArgs:
 
     # API related
     api_key: Optional[str] = None
+    admin_api_key: Optional[str] = None
     served_model_name: Optional[str] = None
     weight_version: str = "default"
     chat_template: Optional[str] = None
@@ -485,6 +491,7 @@ class ServerArgs:
     hicache_write_policy: str = "write_through"
     hicache_io_backend: str = "kernel"
     hicache_mem_layout: str = "layer_first"
+    disable_hicache_numa_detect: bool = False
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "best_effort"
     hicache_storage_backend_extra_config: Optional[str] = None
@@ -1090,7 +1097,7 @@ class ServerArgs:
                     self.attention_backend = "nsa"
                     logger.info("Use nsa attention backend for DeepSeek with DSA.")
 
-                if not is_npu():  # CUDA GPU
+                if not is_npu():  # CUDA or ROCm GPU
                     if self.enable_nsa_prefill_context_parallel:
                         logger.warning(
                             f"Context parallel feature is still under experiment. It has only been verified on Hopper platform."
@@ -1126,8 +1133,15 @@ class ServerArgs:
                                 f"attn_tp_size={self.tp_size}, attention weights will be sharded across {self.tp_size} ranks."
                             )
 
-                    self.page_size = 64
-                    logger.warning("Setting page size to 64 for DeepSeek DSA.")
+                    if is_hip():
+                        self.page_size = 1
+                        logger.warning(
+                            "Setting page size to 1 for DeepSeek DSA on ROCm."
+                        )
+                    else:
+                        # For CUDA GPU
+                        self.page_size = 64
+                        logger.warning("Setting page size to 64 for DeepSeek DSA.")
 
                     # For Hopper, we support both bf16 and fp8 kv cache; for Blackwell, we support fp8 only currently
                     import torch
@@ -1538,6 +1552,33 @@ class ServerArgs:
                         )
                         self.disable_radix_cache = True
                         self.disable_overlap_schedule = False
+        elif model_arch in ["Lfm2ForCausalLM"]:
+            assert (
+                not self.enable_mamba_extra_buffer()
+            ), f"mamba extra_buffer is not supported for {model_arch} model"
+            if not self.disable_radix_cache:
+                logger.warning(
+                    "Disabling overlap schedule since mamba no_buffer is not compatible with "
+                    "overlap schedule, try to use --disable-radix-cache if overlap schedule is necessary"
+                )
+                self.disable_overlap_schedule = True
+                if is_sm100_supported():
+                    if self.attention_backend is None:
+                        self.attention_backend = "flashinfer"
+                        logger.info(
+                            f"Use flashinfer as attention backend on sm100 for {model_arch}"
+                        )
+                    if self.attention_backend == "trtllm_mha":
+                        logger.warning(
+                            "Disabling radix cache since trtllm_mha does not support page_size = 1, which is required by MambaRadixCache. "
+                            "Try to use --attention-backend flashinfer if radix cache is necessary."
+                        )
+                        self.disable_radix_cache = True
+                        self.disable_overlap_schedule = False
+            assert self.attention_backend != "triton", (
+                f"{model_arch} does not support triton attention backend, "
+                "as the first layer might not be an attention layer"
+            )
 
         if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():
             self.disable_overlap_schedule = True
@@ -2000,7 +2041,7 @@ class ServerArgs:
     def _handle_hicache(self):
         if (
             self.hicache_mem_layout == "page_first_direct"
-            and self.hicache_io_backend is "kernel"
+            and self.hicache_io_backend == "kernel"
         ):
             self.hicache_io_backend = "direct"
             logger.warning(
@@ -3103,6 +3144,15 @@ class ServerArgs:
             "Can specify multiple targets, e.g., '--log-requests-target stdout /my/path'. ",
         )
         parser.add_argument(
+            "--uvicorn-access-log-exclude-prefixes",
+            type=str,
+            nargs="*",
+            default=list(DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES),
+            help="Exclude uvicorn access logs whose request path starts with any of these prefixes. "
+            "Defaults to empty (disabled). "
+            "Example: --uvicorn-access-log-exclude-prefixes /metrics /health",
+        )
+        parser.add_argument(
             "--crash-dump-folder",
             type=str,
             default=ServerArgs.crash_dump_folder,
@@ -3244,6 +3294,15 @@ class ServerArgs:
             help="Set API key of the server. It is also used in the OpenAI API compatible server.",
         )
         parser.add_argument(
+            "--admin-api-key",
+            type=str,
+            default=ServerArgs.admin_api_key,
+            help=(
+                "Set admin API key for sensitive management endpoints (e.g. /clear_hicache_storage_backend). "
+                "When set, admin endpoints require this key and do NOT accept --api-key."
+            ),
+        )
+        parser.add_argument(
             "--served-model-name",
             type=str,
             default=ServerArgs.served_model_name,
@@ -3327,8 +3386,8 @@ class ServerArgs:
                 "auto",
                 "round_robin",
                 "follow_bootstrap_room",
-                "shortest_queue",
-                "minimum_tokens",
+                "total_requests",
+                "total_tokens",
             ],
         )
         parser.add_argument(
@@ -3872,6 +3931,11 @@ class ServerArgs:
             ],
             default=ServerArgs.hicache_mem_layout,
             help="The layout of host memory pool for hierarchical cache.",
+        )
+        parser.add_argument(
+            "--disable-hicache-numa-detect",
+            action="store_true",
+            help="Disable binding the process to the NUMA node closest to the active CUDA device when hierarchical cache is enabled.",
         )
         parser.add_argument(
             "--hicache-storage-backend",
