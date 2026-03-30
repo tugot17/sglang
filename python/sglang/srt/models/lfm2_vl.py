@@ -37,7 +37,6 @@ from sglang.srt.managers.mm_utils import (
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputs,
-    flatten_nested_list,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -185,104 +184,95 @@ class Lfm2VlForConditionalGeneration(nn.Module):
         """Process images through vision tower and projector.
 
         Handles SigLip2's NaFlex variable-resolution output.
+        Pixel values arrive padded from the base processor; we pack them
+        using the attention mask before feeding into the vision tower.
         """
-        all_pixel_values = flatten_nested_list([item.feature for item in items])
-        all_pixel_attention_masks = flatten_nested_list(
-            [item.pixel_attention_mask for item in items]
+        # Collect data from all items
+        all_pixel_values = []
+        all_attention_masks = []
+        all_spatial_shapes = []
+
+        for item in items:
+            pv = item.feature
+            am = item.pixel_attention_mask
+            ss = item.spatial_shapes
+
+            if isinstance(pv, np.ndarray):
+                pv = torch.from_numpy(pv)
+            if isinstance(am, np.ndarray):
+                am = torch.from_numpy(am)
+            if isinstance(ss, np.ndarray):
+                ss = torch.from_numpy(ss)
+
+            all_pixel_values.append(pv)
+            all_attention_masks.append(am)
+            all_spatial_shapes.append(ss)
+
+        pixel_values = torch.cat(all_pixel_values, dim=0)
+        attention_mask = torch.cat(all_attention_masks, dim=0)
+        spatial_shapes = torch.cat(all_spatial_shapes, dim=0)
+
+        pixel_values = pixel_values.to(
+            device=self.vision_tower.device,
+            dtype=self.vision_tower.dtype,
         )
-        all_spatial_shapes = flatten_nested_list(
-            [item.spatial_shapes for item in items]
+        spatial_shapes_cpu = spatial_shapes.cpu()
+
+        # Pack padded pixel values using attention mask
+        packed_list = []
+        for i in range(pixel_values.shape[0]):
+            mask = attention_mask[i].bool()
+            packed_list.append(pixel_values[i][mask])
+
+        if not packed_list:
+            return torch.tensor(
+                [], device=self.vision_tower.device, dtype=self.vision_tower.dtype
+            )
+
+        pixel_values_packed = torch.cat(packed_list, dim=0)
+
+        # Compute cu_seqlens and max_seqlen for packed attention
+        spatial_shapes_list = spatial_shapes_cpu.tolist()
+        lengths_list = [int(h * w) for h, w in spatial_shapes_list]
+        total_tokens = sum(lengths_list)
+
+        if total_tokens == 0:
+            return torch.tensor(
+                [], device=self.vision_tower.device, dtype=self.vision_tower.dtype
+            )
+
+        lengths = torch.tensor(
+            lengths_list, dtype=torch.int32, device=pixel_values_packed.device
+        )
+        cu_seqlens = torch.zeros(
+            len(lengths_list) + 1,
+            dtype=torch.int32,
+            device=pixel_values_packed.device,
+        )
+        cu_seqlens[1:] = torch.cumsum(lengths, dim=0)
+        max_seqlen = lengths.max()
+
+        # Forward through vision tower
+        vision_outputs = self.vision_tower(
+            pixel_values_packed=pixel_values_packed,
+            spatial_shapes=spatial_shapes_cpu,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
         )
 
-        image_features_list = []
+        # Get the packed features (remove batch dim if present)
+        if vision_outputs.dim() == 3:
+            vision_features_packed = vision_outputs[0]
+        else:
+            vision_features_packed = vision_outputs
 
-        for pixel_values_batch, attn_mask_batch, shapes_batch in zip(
-            all_pixel_values, all_pixel_attention_masks, all_spatial_shapes
-        ):
-            # Convert numpy arrays to tensors if needed
-            if isinstance(pixel_values_batch, np.ndarray):
-                pixel_values_batch = torch.from_numpy(pixel_values_batch)
-            if isinstance(attn_mask_batch, np.ndarray):
-                attn_mask_batch = torch.from_numpy(attn_mask_batch)
-            if isinstance(shapes_batch, np.ndarray):
-                shapes_batch = torch.from_numpy(shapes_batch)
-
-            # Normalize shapes
-            if pixel_values_batch.dim() == 2:
-                pixel_values_batch = pixel_values_batch.unsqueeze(0)
-            if attn_mask_batch.dim() == 1:
-                attn_mask_batch = attn_mask_batch.unsqueeze(0)
-            if shapes_batch.dim() == 1:
-                shapes_batch = shapes_batch.unsqueeze(0)
-
-            # Cast to vision tower dtype
-            pixel_values_batch = pixel_values_batch.to(
-                device=self.vision_tower.device,
-                dtype=self.vision_tower.dtype,
-            )
-            shapes_batch_cpu = shapes_batch.cpu()
-
-            # Compute cu_seqlens and max_seqlen for packed attention
-            spatial_shapes_list = shapes_batch_cpu.tolist()
-            lengths_list = [h * w for h, w in spatial_shapes_list]
-            total_tokens = sum(lengths_list)
-
-            if total_tokens == 0:
-                continue
-
-            lengths = torch.tensor(
-                lengths_list, dtype=torch.int32, device=pixel_values_batch.device
-            )
-            cu_seqlens = torch.zeros(
-                lengths.shape[0] + 1,
-                dtype=torch.int32,
-                device=pixel_values_batch.device,
-            )
-            cu_seqlens[1:] = torch.cumsum(lengths, dim=0)
-            max_seqlen = lengths.max()
-
-            # Forward through vision tower
-            vision_outputs = self.vision_tower(
-                pixel_values_packed=pixel_values_batch,
-                spatial_shapes=shapes_batch_cpu,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-            )
-
-            # Get the packed features (remove batch dim if present)
-            if vision_outputs.dim() == 3:
-                vision_features_packed = vision_outputs[0]
-            else:
-                vision_features_packed = vision_outputs
-
-            # Project through multimodal projector
-            factor = self.multi_modal_projector.factor
-            projected_lengths_list = []
-            for (height, width), length in zip(spatial_shapes_list, lengths_list):
-                if length <= 0:
-                    projected_lengths_list.append(0)
-                    continue
-                projected_lengths_list.append((height // factor) * (width // factor))
-
-            projected_packed = self.multi_modal_projector(
-                vision_features_packed=vision_features_packed,
-                spatial_shapes=shapes_batch_cpu,
-            )
-
-            # Split back into individual images
-            offset = 0
-            for out_len in projected_lengths_list:
-                if out_len > 0:
-                    image_features_list.append(
-                        projected_packed[offset : offset + out_len]
-                    )
-                offset += out_len
-
-        if image_features_list:
-            return torch.cat(image_features_list, dim=0)
-        return torch.tensor(
-            [], device=self.vision_tower.device, dtype=self.vision_tower.dtype
+        # Project through multimodal projector
+        projected_packed = self.multi_modal_projector(
+            vision_features_packed=vision_features_packed,
+            spatial_shapes=spatial_shapes_cpu,
         )
+
+        return projected_packed
 
     @torch.inference_mode()
     def forward(
