@@ -259,6 +259,15 @@ class Lfm2ShortConv(nn.Module):
         else:
             self.register_parameter("conv_bias", None)
 
+        # Pre-allocated arange buffer for TARGET_VERIFY's intermediate_state_indices
+        # (avoids per-call torch.arange in the spec-decode hot path). Sized to the
+        # default cuda_graph_max_bs; resized lazily if a larger batch shows up.
+        self.register_buffer(
+            "_intermediate_state_indices",
+            torch.arange(256, dtype=torch.int32),
+            persistent=False,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -299,9 +308,11 @@ class Lfm2ShortConv(nn.Module):
             draft_token_num = forward_batch.spec_info.draft_token_num
             bs = req_pool_indices.shape[0]
             Bx_reshaped = Bx.view(bs, draft_token_num, -1).transpose(1, 2)
-            intermediate_state_indices = torch.arange(
-                bs, dtype=torch.int32, device=Bx.device
-            )
+            if self._intermediate_state_indices.shape[0] < bs:
+                self._intermediate_state_indices = torch.arange(
+                    bs, dtype=torch.int32, device=Bx.device
+                )
+            intermediate_state_indices = self._intermediate_state_indices[:bs]
             conv_out = causal_conv1d_update_triton(
                 Bx_reshaped,
                 conv_state,
