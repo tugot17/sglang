@@ -12,7 +12,7 @@ Uses optimized causal_conv1d kernels from the mamba package for fast inference.
 """
 
 import logging
-from typing import Iterable, Optional, Set, Tuple
+from typing import Iterable, List, Optional, Set, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -24,6 +24,10 @@ from sglang.srt.layers.attention.mamba.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+    causal_conv1d_update as causal_conv1d_update_triton,
+)
+from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -266,6 +270,10 @@ class Lfm2ShortConv(nn.Module):
         layer_cache = forward_batch.req_to_token_pool.mamba2_layer_cache(self.layer_idx)
         conv_state = layer_cache.conv[0]
         req_pool_indices = forward_batch.req_pool_indices
+        # Pools are independent allocators; extra_buffer adds tracking slots.
+        mamba_cache_indices = forward_batch.req_to_token_pool.get_mamba_indices(
+            req_pool_indices
+        )
 
         # Project and split into gates: B (pre-conv), C (post-conv), x (input)
         proj, _ = self.in_proj(hidden_states)
@@ -280,8 +288,31 @@ class Lfm2ShortConv(nn.Module):
                 self.conv_weight,
                 self.conv_bias,
                 activation=None,
-                conv_state_indices=req_pool_indices.to(torch.int32),
+                conv_state_indices=mamba_cache_indices,
             )
+        elif forward_batch.forward_mode.is_target_verify():
+            # Tape per-step conv windows into intermediate_conv_window so the
+            # backend can roll state back to the accepted boundary after verify.
+            assert isinstance(layer_cache, MambaPool.SpeculativeState), (
+                "LFM2 TARGET_VERIFY requires --mamba-scheduler-strategy extra_buffer."
+            )
+            draft_token_num = forward_batch.spec_info.draft_token_num
+            bs = req_pool_indices.shape[0]
+            Bx_reshaped = Bx.view(bs, draft_token_num, -1).transpose(1, 2)
+            intermediate_state_indices = torch.arange(
+                bs, dtype=torch.int32, device=Bx.device
+            )
+            conv_out = causal_conv1d_update_triton(
+                Bx_reshaped,
+                conv_state,
+                self.conv_weight,
+                self.conv_bias,
+                activation=None,
+                conv_state_indices=mamba_cache_indices,
+                intermediate_conv_window=layer_cache.intermediate_conv_window[0],
+                intermediate_state_indices=intermediate_state_indices,
+            )
+            conv_out = conv_out.transpose(1, 2).reshape(bs * draft_token_num, -1)
         else:
             # Prefill: multiple tokens, use varlen kernel
             T = hidden_states.shape[0]
@@ -298,12 +329,12 @@ class Lfm2ShortConv(nn.Module):
                         ),
                     ]
                 )
-                cache_indices = req_pool_indices.to(torch.int32)
+                cache_indices = mamba_cache_indices
             else:
                 query_start_loc = torch.tensor(
                     [0, T], dtype=torch.int32, device=hidden_states.device
                 )
-                cache_indices = req_pool_indices[:1].to(torch.int32)
+                cache_indices = mamba_cache_indices[:1]
 
             conv_out = causal_conv1d_fn(
                 Bx_t,
@@ -365,9 +396,13 @@ class Lfm2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
+        captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if not forward_batch.forward_mode.is_idle():
+            if captured_last_layer_outputs is not None:
+                captured_last_layer_outputs.append(hidden_states)
+
             residual = hidden_states
             normed = self.operator_norm(hidden_states)
 
@@ -419,6 +454,13 @@ class Lfm2Model(nn.Module):
         )
         self.embedding_norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
 
+        self.layers_to_capture: List[int] = []
+
+    def set_dflash_layers_to_capture(self, layers_to_capture: List[int]):
+        self.layers_to_capture = list(layers_to_capture)
+        for layer_id in self.layers_to_capture:
+            setattr(self.layers[layer_id], "_is_layer_to_capture", True)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -431,16 +473,26 @@ class Lfm2Model(nn.Module):
         )
 
         residual = None
+        aux_hidden_states: List[torch.Tensor] = []
         for i in range(len(self.layers)):
-            hidden_states, residual = self.layers[i](
+            layer = self.layers[i]
+            hidden_states, residual = layer(
                 layer_id=i,
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
                 forward_batch=forward_batch,
+                captured_last_layer_outputs=(
+                    aux_hidden_states
+                    if getattr(layer, "_is_layer_to_capture", False)
+                    else None
+                ),
             )
 
-        return self.embedding_norm(hidden_states)
+        normalized = self.embedding_norm(hidden_states)
+        if not aux_hidden_states:
+            return normalized
+        return normalized, aux_hidden_states
 
 
 class Lfm2ForCausalLM(nn.Module):
@@ -477,6 +529,18 @@ class Lfm2ForCausalLM(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
+    @property
+    def capture_aux_hidden_states(self) -> bool:
+        return bool(self.model.layers_to_capture)
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+        # Mark layer L to capture its input, which is the output of layer L-1.
+        # Draft `target_layer_ids` refer to output indices, so shift by +1.
+        self.model.set_dflash_layers_to_capture([val + 1 for val in layer_ids])
+
+
     @torch.no_grad()
     def forward(
         self,
@@ -487,8 +551,18 @@ class Lfm2ForCausalLM(nn.Module):
         **kwargs,
     ):
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
+
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
+            input_ids,
+            hidden_states,
+            self.lm_head,
+            forward_batch,
+            aux_hidden_states,
         )
 
     def load_weights(
