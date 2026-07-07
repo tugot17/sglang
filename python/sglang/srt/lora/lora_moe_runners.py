@@ -24,10 +24,26 @@ without needing a per-backend LoRA runner subclass.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Callable
 
 import torch
+
+_LORA_DEBUG_NORMS = bool(os.environ.get("SGLANG_LORA_DEBUG_NORMS"))
+
+
+def _debug_norm_report(tag: str, cache: torch.Tensor, before: torch.Tensor) -> None:
+    delta = (cache.detach().float() - before).norm().item()
+    try:
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    except Exception:
+        rank = -1
+    print(
+        f"[LORA_DEBUG_NORM] rank={rank} {tag} cache_shape={tuple(cache.shape)} "
+        f"delta_norm={delta:.6f}",
+        flush=True,
+    )
 
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.utils import is_cuda, is_hip, is_xpu, next_power_of_2
@@ -334,6 +350,9 @@ def _add_lora_gate_up_delta(
     if lora_info.experts_shared_outer_loras and not lora_info.lora_use_virtual_experts:
         gate_up_a = gate_up_a.expand(-1, lora_info.num_experts, -1, -1)
 
+    _dbg = _LORA_DEBUG_NORMS and not get_is_capture_mode()
+    _dbg_before = intermediate_cache.detach().float().clone() if _dbg else None
+
     # Detect gated vs non-gated from A buffer rank dimension.
     # Gated: A has 2*r rows (gate + up). Non-gated: A has 1*r rows (w1 only).
     is_gated = gate_up_a.shape[2] > r
@@ -394,6 +413,9 @@ def _add_lora_gate_up_delta(
             fully_sharded=lora_info.fully_sharded,
         )
 
+    if _dbg:
+        _debug_norm_report("gate_up", intermediate_cache, _dbg_before)
+
 
 def _add_lora_down_delta(
     intermediate_input: torch.Tensor,
@@ -429,6 +451,9 @@ def _add_lora_down_delta(
         offset = shard_size * lora_info.tp_rank
     else:
         offset = 0
+
+    _dbg = _LORA_DEBUG_NORMS and not get_is_capture_mode()
+    _dbg_before = intermediate_cache.detach().float().clone() if _dbg else None
 
     if lora_info.lora_use_virtual_experts:
         merged_experts_fused_moe_lora_add(
@@ -477,6 +502,9 @@ def _add_lora_down_delta(
             fully_sharded=lora_info.fully_sharded,
             offset=offset,
         )
+
+    if _dbg:
+        _debug_norm_report("down", intermediate_cache, _dbg_before)
 
 
 def build_lora_hooks(

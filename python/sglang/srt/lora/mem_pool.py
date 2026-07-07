@@ -1195,6 +1195,41 @@ class LoRAMemoryPool:
                         # contracts over the full padded max_rank, so the tail must be clean.
                         target_buffer[buffer_id, :, lora_rank:].zero_()
 
+        # DEBUG (tp2 MoE LoRA investigation): dump the populated MoE LoRA
+        # buffers for one layer so they can be compared offline against
+        # hand-sliced expectations from the adapter checkpoint.
+        import os as _os
+
+        _dump_prefix = _os.environ.get("SGLANG_LORA_DEBUG_DUMP")
+        if _dump_prefix:
+            _dbg_layer = int(_os.environ.get("SGLANG_LORA_DEBUG_LAYER", "2"))
+            _dump = {
+                "uid": uid,
+                "buffer_id": buffer_id,
+                "layer": _dbg_layer,
+                "moe_tp_rank": self.moe_tp_rank,
+                "moe_tp_size": self.moe_tp_size,
+                "tp_rank": self.tp_rank,
+                "scaling": float(lora_adapter.scaling),
+                "max_lora_rank": self.max_lora_rank,
+            }
+            for _nm in ("gate_up_proj_moe", "down_proj_moe"):
+                if _nm in self.A_buffer:
+                    _dump[f"A_{_nm}"] = (
+                        self.A_buffer[_nm][_dbg_layer][buffer_id].detach().float().cpu()
+                    )
+                    _dump[f"B_{_nm}"] = (
+                        self.B_buffer[_nm][_dbg_layer][buffer_id].detach().float().cpu()
+                    )
+            _path = f"{_dump_prefix}.moe_tp{self.moe_tp_rank}.pt"
+            torch.save(_dump, _path)
+            logger.info(
+                "[LORA_DEBUG] dumped MoE LoRA buffers (layer %d, uid %s) to %s",
+                _dbg_layer,
+                uid,
+                _path,
+            )
+
         if lora_adapter.embedding_layers:
             org_vocab_size = self.base_hf_config.vocab_size
             lora_added_tokens_size = lora_adapter.config.lora_added_tokens_size
