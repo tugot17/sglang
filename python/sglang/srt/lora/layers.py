@@ -1043,6 +1043,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         """
         # Get the base layer's dispatch and combine logic
         base_layer = self.base_layer
+        origin_hidden_states_dim = hidden_states.shape[-1]
 
         # Dispatch tokens (doesn't do much in the LoRA case)
         dispatch_output = base_layer.dispatcher.dispatch(
@@ -1068,6 +1069,19 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             )
 
         final_hidden_states = base_layer.dispatcher.combine(combine_input=combine_input)
+
+        final_hidden_states = final_hidden_states[
+            ..., :origin_hidden_states_dim
+        ].contiguous()
+
+        # Mirror FusedMoE.forward_impl: under multi-rank MoE (TP inner-shard
+        # or EP) each rank holds only a partial expert output after combine;
+        # without this reduction the wrapped layer silently returns partial
+        # sums and generation degrades.
+        if base_layer.reduce_results and (
+            base_layer.moe_tp_size > 1 or base_layer.moe_ep_size > 1
+        ):
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states
 
