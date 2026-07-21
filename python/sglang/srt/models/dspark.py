@@ -469,7 +469,7 @@ class DSparkDraftMixin:
         commit_lens: Optional[torch.Tensor] = None,
     ) -> None:
         ctx_hidden = self.project_target_hidden(target_hidden)
-        for layer in self.layers:
+        for layer in self.kv_context_layers():
             attn = layer.self_attn
             k, v = attn.kv_proj_only(ctx_hidden)
             k = attn.apply_k_norm(k)

@@ -374,6 +374,14 @@ class DFlashDraftModel(nn.Module):
     def get_attention_sliding_window_size(self) -> Optional[int]:
         return get_dflash_attention_sliding_window_size(self.config)
 
+    def kv_context_layers(self) -> list:
+        """Layers that read target-context KV (i.e. have self-attention).
+
+        Context-KV materialization iterates these. Drafts whose layer list mixes
+        in non-attention layers (e.g. LFM2 conv hybrids) override this to filter.
+        """
+        return list(self.layers)
+
     def prepare_context_hidden_for_kv(
         self, layer: DFlashDecoderLayer, ctx_hidden: torch.Tensor
     ) -> torch.Tensor:

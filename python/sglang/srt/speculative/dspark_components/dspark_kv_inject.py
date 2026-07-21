@@ -39,6 +39,7 @@ class TargetHiddenKvInjector:
         # Fused KV materialization (batched GEMM + single Triton norm/rope kernel)
         # replaces the per-layer eager loop in write_target_hidden_kv. None if the
         # draft is ineligible or we are off-CUDA; the eager path stays as fallback.
+        self._kv_context_layers = None
         self._fused_kv_helper = self._build_fused_kv_helper()
 
     def _build_fused_kv_helper(self) -> Optional[FusedKVMaterializeHelper]:
@@ -51,7 +52,9 @@ class TargetHiddenKvInjector:
         try:
             if not (is_cuda() or is_hip()):
                 return None
-            layers = self.draft_model.layers
+            # Only attention layers read context KV; LFM2 conv-hybrid drafts
+            # return a filtered list here.
+            layers = self.draft_model.kv_context_layers()
             if len(layers) == 0 or not self.draft_model.supports_fused_context_kv:
                 return None
 
@@ -81,6 +84,7 @@ class TargetHiddenKvInjector:
                     return None
 
             first_attn = layers[0].self_attn
+            self._kv_context_layers = layers
             helper = FusedKVMaterializeHelper(
                 layers=layers,
                 rotary_emb=first_attn.rotary_emb,
@@ -117,7 +121,9 @@ class TargetHiddenKvInjector:
         def _write_layer_kv(
             layer_idx: int, cache_k: torch.Tensor, cache_v: torch.Tensor
         ) -> None:
-            attn = self.draft_model.layers[layer_idx].self_attn.attn
+            # layer_idx indexes the helper's (KV-context) layer list, which may
+            # be a filtered subset of draft_model.layers for conv hybrids.
+            attn = self._kv_context_layers[layer_idx].self_attn.attn
             if cache_loc_2d is not None and commit_lens is not None:
                 pool.set_kv_buffer_prefix_valid(
                     attn,
